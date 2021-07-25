@@ -4,11 +4,15 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module Test.Sandwich.ArgParsing where
 
 import Control.Monad.Logger
 import Data.Function
+import qualified Data.List as L
 import Data.Maybe
 import qualified Data.Text as T
 import Data.Time.Clock.POSIX
@@ -21,8 +25,11 @@ import Test.Sandwich.Formatters.Print.Types
 import Test.Sandwich.Formatters.Silent
 import Test.Sandwich.Formatters.TerminalUI
 import Test.Sandwich.Formatters.TerminalUI.Types
+import Test.Sandwich.Internal.Running
 import Test.Sandwich.Options
 import Test.Sandwich.Types.ArgParsing
+import Test.Sandwich.Types.RunTree
+import Test.Sandwich.Types.Spec
 
 #if MIN_VERSION_time(1,9,0)
 import Data.Time.Format.ISO8601
@@ -38,6 +45,13 @@ commandLineOptionsWithInfo userOptionsParser individualTestParser = OA.info (mai
     fullDesc
     <> progDesc "Run tests with Sandwich"
     <> header "Sandwich test runner"
+  )
+
+quickCheckOptionsWithInfo :: ParserInfo CommandLineQuickCheckOptions
+quickCheckOptionsWithInfo = OA.info (commandLineQuickCheckOptions mempty <**> helper)
+  (
+    briefDesc
+    <> header "Special options used by sandwich-quickcheck.\n\nIf a flag is passed, it will override the value in the QuickCheck option configured in the code."
   )
 
 slackOptionsWithInfo :: ParserInfo CommandLineSlackOptions
@@ -62,15 +76,18 @@ mainCommandLineOptions userOptionsParser individualTestParser = CommandLineOptio
   <*> optional (strOption (long "filter" <> short 'f' <> help "Filter test tree by string matching text example labels" <> metavar "STRING"))
   <*> option auto (long "repeat" <> short 'r' <> showDefault <> help "Repeat the test N times and report how many failures occur" <> value 1 <> metavar "INT")
   <*> optional (strOption (long "fixed-root" <> help "Store test artifacts at a fixed path" <> metavar "STRING"))
+  <*> optional (flag False True (long "dry-run" <> help "Skip actually launching the tests. This is useful if you want to see the set of the tests that would be run, or start them manually in the terminal UI."))
 
   <*> optional (flag False True (long "list-tests" <> help "List individual test modules"))
+  <*> optional (flag False True (long "print-quickcheck-flags" <> help "Print the additional QuickCheck flags"))
   <*> optional (flag False True (long "print-slack-flags" <> help "Print the additional Slack flags"))
   <*> optional (flag False True (long "print-webdriver-flags" <> help "Print the additional Webdriver flags"))
 
   <*> individualTestParser
 
-  <*> commandLineWebdriverOptions internal
+  <*> commandLineQuickCheckOptions internal
   <*> commandLineSlackOptions internal
+  <*> commandLineWebdriverOptions internal
 
   <*> userOptionsParser
 
@@ -108,6 +125,14 @@ display maybeInternal =
   <|> flag' Headless (long "headless" <> help "Open browser in headless mode" <> maybeInternal)
   <|> flag Current Xvfb (long "xvfb" <> help "Open browser in Xvfb session" <> maybeInternal)
 
+commandLineQuickCheckOptions :: (forall f a. Mod f a) -> Parser CommandLineQuickCheckOptions
+commandLineQuickCheckOptions maybeInternal = CommandLineQuickCheckOptions
+  <$> optional (option auto (long "quickcheck-seed" <> help "QuickCheck seed" <> metavar "INT" <> maybeInternal))
+  <*> optional (option auto (long "quickcheck-max-discard-ratio" <> help "Maximum number of discarded tests per successful test before giving up" <> metavar "INT" <> maybeInternal))
+  <*> optional (option auto (long "quickcheck-max-size" <> help "Size to use for the biggest test cases" <> metavar "INT" <> maybeInternal))
+  <*> optional (option auto (long "quickcheck-max-success" <> help "Maximum number of successful tests before succeeding" <> metavar "INT" <> maybeInternal))
+  <*> optional (option auto (long "quickcheck-max-shrinks" <> help "Maximum number of shrinks before giving up" <> metavar "INT" <> maybeInternal))
+
 commandLineSlackOptions :: (forall f a. Mod f a) -> Parser CommandLineSlackOptions
 commandLineSlackOptions maybeInternal = CommandLineSlackOptions
   <$> optional (strOption (long "slack-token" <> help "Slack token to use with the Slack formatter" <> metavar "STRING" <> maybeInternal))
@@ -123,7 +148,43 @@ commandLineSlackOptions maybeInternal = CommandLineSlackOptions
 
   <*> optional (option auto (long "slack-max-message-size" <> help "Maximum message size in bytes (default: 8192)" <> metavar "INT" <> maybeInternal))
 
--- * Main parsing function
+-- * Parse command line args
+
+parseCommandLineArgs :: forall a. (Typeable a) => Parser a -> TopSpecWithOptions' a -> IO (CommandLineOptions a)
+parseCommandLineArgs parser spec = do
+  (clo, _, _) <- parseCommandLineArgs' parser spec
+  return clo
+
+parseCommandLineArgs' :: forall a. (Typeable a) => Parser a -> TopSpecWithOptions' a -> IO (
+  CommandLineOptions a
+  , Mod FlagFields (Maybe IndividualTestModule) -> Parser (Maybe IndividualTestModule)
+  , [(NodeModuleInfo, T.Text)]
+  )
+parseCommandLineArgs' userOptionsParser spec = do
+  let modulesAndShorthands = gatherMainFunctions (spec :: SpecFree (LabelValue "commandLineOptions" (CommandLineOptions a) :> BaseContext) IO ())
+                           & L.sortOn nodeModuleInfoModuleName
+                           & gatherShorthands
+  let individualTestFlags maybeInternal =
+        [[ Just $ flag' (Just $ IndividualTestModuleName nodeModuleInfoModuleName)
+                        (long (T.unpack shorthand)
+                          <> help (nodeModuleInfoModuleName
+                          <> (if isJust nodeModuleInfoFn then "*" else ""))
+                          <> maybeInternal)
+         , case nodeModuleInfoFn of
+             Nothing -> Nothing
+             Just fn -> Just $ flag' (Just $ IndividualTestMainFn fn)
+                                     (long (T.unpack (shorthand <> "-main"))
+                                       <> help nodeModuleInfoModuleName
+                                       <> internal
+                                     )
+         ]
+        | (NodeModuleInfo {..}, shorthand) <- modulesAndShorthands]
+  let individualTestParser maybeInternal = foldr (<|>) (pure Nothing) (catMaybes $ mconcat $ individualTestFlags maybeInternal)
+
+  clo <- OA.execParser (commandLineOptionsWithInfo userOptionsParser (individualTestParser internal))
+  return (clo, individualTestParser, modulesAndShorthands)
+
+-- * Merge command line args with base options
 
 addOptionsFromArgs :: Options -> CommandLineOptions a -> IO (Options, Int)
 addOptionsFromArgs baseOptions (CommandLineOptions {..}) = do
@@ -152,6 +213,7 @@ addOptionsFromArgs baseOptions (CommandLineOptions {..}) = do
       Just path -> TestArtifactsFixedDirectory path
     , optionsFilterTree = TreeFilter <$> optTreeFilter
     , optionsFormatters = baseFormatters <> catMaybes [maybeMainFormatter]
+    , optionsDryRun = fromMaybe (optionsDryRun baseOptions) optDryRun
     }
 
   return (options, optRepeatCount)

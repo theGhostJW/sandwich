@@ -9,12 +9,6 @@ import Data.String.Interpolate
 import Data.Time.Clock
 import Test.QuickCheck
 import Test.Sandwich
-    ( describe,
-      runSandwichWithCommandLineArgs,
-      defaultOptions,
-      Options(optionsTestArtifactsDirectory),
-      TestArtifactsDirectory(TestArtifactsGeneratedDirectory),
-      TopSpec )
 import Test.Sandwich.QuickCheck
 
 

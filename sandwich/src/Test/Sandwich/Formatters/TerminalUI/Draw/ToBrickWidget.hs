@@ -34,6 +34,8 @@ instance ToBrickWidget Status where
   toBrickWidget (Running {statusStartTime}) = return $ strWrap [i|Started at #{statusStartTime}|]
   toBrickWidget (Done startTime endTime Success) = return $ strWrap [i|Succeeded in #{formatNominalDiffTime (diffUTCTime endTime startTime)}|]
   toBrickWidget (Done {statusResult=(Failure failureReason)}) = toBrickWidget failureReason
+  toBrickWidget (Done {statusResult=DryRun}) = return $ strWrap "Not started due to dry run"
+  toBrickWidget (Done {statusResult=Cancelled}) = return $ strWrap "Cancelled"
 
 instance ToBrickWidget FailureReason where
   toBrickWidget (ExpectedButGot _ (SEB x1) (SEB x2)) = do
